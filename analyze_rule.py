@@ -403,12 +403,32 @@ class RuleFetcher:
     ) -> List[Dict[str, Any]]:
         """
         Fetch all pages of a rulebase and return the flat list of raw nodes.
-        Uses the same payload format as fw-review.
+
+        CP pagination notes
+        -------------------
+        In show-access-rulebase the `offset` parameter counts individual
+        ACCESS RULES (sub-rules within sections), not top-level section
+        nodes. The `total` field reflects the same count. However, the
+        `rulebase` array in each response can contain section nodes whose
+        embedded `rulebase` sub-list already includes their child rules.
+
+        To advance the offset correctly we count the rules contained in
+        each page (recursively through sections) rather than the number of
+        top-level nodes returned. This ensures we page past all sections
+        and reach the rules at the end of the layer (e.g. a CATCH-ALL at
+        rule 2234-2236).
         """
         nodes: List[Dict[str, Any]] = []
         offset = 0
-        limit  = 200
+        limit  = 500   # large enough to usually pull all rules in one shot
+        seen_offsets: set = set()
+
         while True:
+            if offset in seen_offsets:
+                log.warning("Pagination loop detected at offset %d — stopping.", offset)
+                break
+            seen_offsets.add(offset)
+
             payload = {
                 **layer_selector,
                 "offset": offset,
@@ -419,14 +439,31 @@ class RuleFetcher:
             }
             resp = self.session.call("show-access-rulebase", payload)
             page = resp.get("rulebase", [])
+            if not page:
+                break
             nodes.extend(page)
-            total   = resp.get("total", 0)
-            fetched = len(page)
-            offset += fetched
+
+            total = resp.get("total", 0)
+            # Count individual rules in this page (recurse through sections)
+            page_rule_count = _count_rules_in_nodes(page)
+            log.debug(
+                "show-access-rulebase: offset=%d  page_nodes=%d  "
+                "page_rules=%d  total=%s",
+                offset, len(page), page_rule_count, total,
+            )
+
+            if page_rule_count == 0:
+                break
+            offset += page_rule_count
+
             if total and offset >= int(total):
                 break
-            if fetched < limit:
+            # Safety: if we got fewer rules than limit but total is not
+            # reached, one more attempt is allowed (CP may under-report
+            # total for sections). If the next page returns nothing we stop.
+            if page_rule_count < limit and (not total or offset >= int(total)):
                 break
+
         return nodes
 
     # ------------------------------------------------------------------
@@ -625,6 +662,45 @@ def _flatten_rulebase(item: Dict[str, Any]) -> List[Dict[str, Any]]:
             rules.extend(_flatten_rulebase(sub))
         return rules
     return [item]
+
+
+def _count_rules_in_nodes(nodes: List[Dict[str, Any]]) -> int:
+    """
+    Count individual access rules (not sections) in a rulebase node list.
+    Used to advance the offset correctly when sections are present.
+    """
+    count = 0
+    for node in nodes:
+        if node.get("type") == "access-section":
+            count += _count_rules_in_nodes(node.get("rulebase", []))
+        else:
+            count += 1
+    return count
+
+
+def _extract_ref_names(value: Any) -> str:
+    """Extract a compact display string from an object-reference list."""
+    if not value:
+        return "any"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        name = value.get("name") or value.get("uid", "?")
+        return str(name).lower()
+    if isinstance(value, list):
+        names = []
+        for item in value:
+            if isinstance(item, dict):
+                n = item.get("name") or item.get("uid", "?")
+                names.append(str(n))
+            else:
+                names.append(str(item))
+        if not names:
+            return "any"
+        if len(names) <= 3:
+            return ", ".join(names)
+        return ", ".join(names[:3]) + f" (+{len(names)-3})"
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -1759,19 +1835,29 @@ def main() -> int:
             log.info("Listing rules for layer hint '%s' …", layer_hint)
             rules_list = fetcher.list_rules(layer_hint)
             print(f"\nRules in layer '{layer_hint}':")
-            print(f"  {'#':<5}  {'UID':<38}  {'NAME':<35}  ACTION")
-            print(f"  {'─'*5}  {'─'*38}  {'─'*35}  {'─'*10}")
+            hdr = (
+                f"  {'#':<5}  {'UID':<38}  {'SRC':<22}  "
+                f"{'DST':<22}  {'SVC':<16}  {'ACTION':<10}  NAME"
+            )
+            print(hdr)
+            print(f"  {'─'*5}  {'─'*38}  {'─'*22}  {'─'*22}  {'─'*16}  {'─'*10}  {'─'*20}")
             for idx, r in enumerate(rules_list, 1):
                 action_raw = r.get("action", {})
                 action = (
                     action_raw.get("name", str(action_raw))
                     if isinstance(action_raw, dict) else str(action_raw)
                 )
-                name = r.get("name", "")[:35]
-                uid  = r.get("uid", "")
-                il   = r.get("inline-layer")
-                il_mark = " [inline-layer]" if il else ""
-                print(f"  {idx:<5}  {uid:<38}  {name:<35}  {action}{il_mark}")
+                name   = (r.get("name") or "")[:20]
+                uid    = r.get("uid", "")
+                src    = _extract_ref_names(r.get("source", []))[:22]
+                dst    = _extract_ref_names(r.get("destination", []))[:22]
+                svc    = _extract_ref_names(r.get("service", []))[:16]
+                il     = r.get("inline-layer")
+                il_mark = " [IL]" if il else ""
+                print(
+                    f"  {idx:<5}  {uid:<38}  {src:<22}  "
+                    f"{dst:<22}  {svc:<16}  {action:<10}  {name}{il_mark}"
+                )
             print(f"\n  Total: {len(rules_list)} rules\n")
             return 0
 
