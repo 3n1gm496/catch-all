@@ -398,12 +398,16 @@ class RuleFetcher:
         return {"uid": first["uid"]} if first.get("uid") else {"name": first["name"]}
 
     # ------------------------------------------------------------------
-    def _find_rule_in_rulebase(
-        self, layer_selector: Dict[str, Any], rule_uuid: str
-    ) -> Dict[str, Any]:
-        """Walk through the rulebase and return the matching rule dict."""
+    def _fetch_rulebase_pages(
+        self, layer_selector: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch all pages of a rulebase and return the flat list of raw nodes.
+        Uses the same payload format as fw-review.
+        """
+        nodes: List[Dict[str, Any]] = []
         offset = 0
-        limit  = 200   # matches fw-review's page_limit default
+        limit  = 200
         while True:
             payload = {
                 **layer_selector,
@@ -414,23 +418,162 @@ class RuleFetcher:
                 "show-hits": False,
             }
             resp = self.session.call("show-access-rulebase", payload)
-            rulebase = resp.get("rulebase", [])
-            for item in rulebase:
-                for rule in _flatten_rulebase(item):
-                    if rule.get("uid") == rule_uuid:
-                        return rule
-            total = resp.get("total", 0)
-            fetched = len(rulebase)
+            page = resp.get("rulebase", [])
+            nodes.extend(page)
+            total   = resp.get("total", 0)
+            fetched = len(page)
             offset += fetched
             if total and offset >= int(total):
                 break
             if fetched < limit:
                 break
+        return nodes
 
+    # ------------------------------------------------------------------
+    def _find_rule_in_rulebase(
+        self, layer_selector: Dict[str, Any], rule_uuid: str
+    ) -> Dict[str, Any]:
+        """
+        Walk through the rulebase (and any inline layers) to find the rule.
+
+        CP rulebases can contain:
+          - access-rule  → regular rule
+          - access-section → named group; has a "rulebase" sub-list
+          - rules with "inline-layer" → the rule is a container; its children
+            live in a separate layer that must be fetched by that layer's UID
+
+        We scan the top-level layer first, then recurse into every inline
+        layer referenced by rules found there.
+        """
         layer_label = layer_selector.get("uid") or layer_selector.get("name", "?")
+        log.debug("Scanning layer %s …", layer_label)
+
+        nodes = self._fetch_rulebase_pages(layer_selector)
+        found = self._search_nodes(nodes, rule_uuid, layer_label, depth=0)
+        if found is not None:
+            return found
+
         raise ValueError(
-            f"Rule {rule_uuid} not found in layer {layer_label} / package {self.package}"
+            f"Rule {rule_uuid} not found in layer {layer_label} / package {self.package}.\n"
+            "  Hint: use --list-rules to see all rule UIDs in this layer.\n"
+            "  If the rule is inside an inline layer, make sure to pass the\n"
+            "  inline layer UID (or name) via --layer-uuid / --layer-name."
         )
+
+    # ------------------------------------------------------------------
+    def _search_nodes(
+        self,
+        nodes: List[Dict[str, Any]],
+        rule_uuid: str,
+        layer_label: str,
+        depth: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Recursively search nodes for rule_uuid.
+        Recurses into access-sections and inline layers (up to depth 5).
+        """
+        if depth > 5:
+            log.warning("Max inline-layer recursion depth reached; stopping.")
+            return None
+
+        for node in nodes:
+            node_type = node.get("type", "access-rule")
+
+            # Direct match
+            if node.get("uid") == rule_uuid:
+                log.info("Rule found in layer %s (depth=%d)", layer_label, depth)
+                return node
+
+            # access-section: recurse into its sub-nodes
+            if node_type == "access-section":
+                sub = node.get("rulebase", [])
+                found = self._search_nodes(sub, rule_uuid, layer_label, depth)
+                if found is not None:
+                    return found
+                continue
+
+            # Rule with inline-layer: fetch and search the inline layer
+            inline_ref = node.get("inline-layer")
+            if inline_ref:
+                if isinstance(inline_ref, dict):
+                    il_uid  = inline_ref.get("uid")
+                    il_name = inline_ref.get("name")
+                else:
+                    il_uid  = str(inline_ref)
+                    il_name = None
+
+                il_selector: Dict[str, Any] = {}
+                if il_uid:
+                    il_selector["uid"] = il_uid
+                elif il_name:
+                    il_selector["name"] = il_name
+                else:
+                    continue
+
+                il_label = il_uid or il_name or "?"
+                log.debug("Descending into inline layer %s …", il_label)
+                try:
+                    il_nodes = self._fetch_rulebase_pages(il_selector)
+                    found = self._search_nodes(il_nodes, rule_uuid, il_label, depth + 1)
+                    if found is not None:
+                        return found
+                except Exception as exc:
+                    log.warning(
+                        "Could not fetch inline layer %s: %s", il_label, exc
+                    )
+
+        return None
+
+    # ------------------------------------------------------------------
+    def list_rules(self, layer_hint: str) -> List[Dict[str, Any]]:
+        """
+        Return a flat list of all rules in the layer (including inline layers).
+        Used by --list-rules mode.
+        """
+        layer_selector = self._resolve_layer(layer_hint)
+        nodes          = self._fetch_rulebase_pages(layer_selector)
+        return self._collect_all_rules(nodes, depth=0)
+
+    # ------------------------------------------------------------------
+    def _collect_all_rules(
+        self, nodes: List[Dict[str, Any]], depth: int
+    ) -> List[Dict[str, Any]]:
+        """Recursively collect every rule (including those in inline layers)."""
+        if depth > 5:
+            return []
+        result: List[Dict[str, Any]] = []
+        for node in nodes:
+            node_type = node.get("type", "access-rule")
+            if node_type == "access-section":
+                result.extend(
+                    self._collect_all_rules(node.get("rulebase", []), depth)
+                )
+                continue
+            # Append the rule itself (even if it has an inline-layer)
+            result.append(node)
+            inline_ref = node.get("inline-layer")
+            if inline_ref:
+                if isinstance(inline_ref, dict):
+                    il_uid  = inline_ref.get("uid")
+                    il_name = inline_ref.get("name")
+                else:
+                    il_uid  = str(inline_ref)
+                    il_name = None
+                il_selector: Dict[str, Any] = {}
+                if il_uid:
+                    il_selector["uid"] = il_uid
+                elif il_name:
+                    il_selector["name"] = il_name
+                if il_selector:
+                    try:
+                        il_nodes = self._fetch_rulebase_pages(il_selector)
+                        result.extend(self._collect_all_rules(il_nodes, depth + 1))
+                    except Exception as exc:
+                        log.warning(
+                            "Could not fetch inline layer %s: %s",
+                            il_uid or il_name, exc,
+                        )
+        return result
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -1558,6 +1701,14 @@ Examples:
         action="store_true",
         help="List all access layers in the package and exit (no rule-uuid needed)",
     )
+    p.add_argument(
+        "--list-rules",
+        action="store_true",
+        help=(
+            "List all rules (uid, name, action) in the specified layer "
+            "including inline layers, then exit. Requires --layer-uuid or --layer-name."
+        ),
+    )
     p.add_argument("--rule-uuid",  default=None,            help="Rule UID to analyze")
     p.add_argument("--days",       type=int, default=DEFAULT_DAYS,
                    help=f"Days of log history to analyze (default: {DEFAULT_DAYS})")
@@ -1582,11 +1733,13 @@ def main() -> int:
         parser.error("--days must be >= 1")
 
     # --list-layers does not require --layer-uuid / --rule-uuid
-    if not args.list_layers:
+    if not args.list_layers and not args.list_rules:
         if not args.rule_uuid:
-            parser.error("--rule-uuid is required (unless --list-layers is used)")
+            parser.error("--rule-uuid is required (unless --list-layers or --list-rules is used)")
         if not args.layer_uuid and not args.layer_name:
             parser.error("--layer-uuid or --layer-name is required (unless --list-layers is used)")
+    if args.list_rules and not args.layer_uuid and not args.layer_name:
+        parser.error("--list-rules requires --layer-uuid or --layer-name")
 
     # Resolve the layer hint: prefer explicit name, then uuid
     layer_hint: str = args.layer_name or args.layer_uuid or ""
@@ -1600,6 +1753,27 @@ def main() -> int:
     try:
         session.login()
         fetcher = RuleFetcher(session, args.package)
+
+        # --list-rules mode: dump all rules in the layer then exit ------------
+        if args.list_rules:
+            log.info("Listing rules for layer hint '%s' …", layer_hint)
+            rules_list = fetcher.list_rules(layer_hint)
+            print(f"\nRules in layer '{layer_hint}':")
+            print(f"  {'#':<5}  {'UID':<38}  {'NAME':<35}  ACTION")
+            print(f"  {'─'*5}  {'─'*38}  {'─'*35}  {'─'*10}")
+            for idx, r in enumerate(rules_list, 1):
+                action_raw = r.get("action", {})
+                action = (
+                    action_raw.get("name", str(action_raw))
+                    if isinstance(action_raw, dict) else str(action_raw)
+                )
+                name = r.get("name", "")[:35]
+                uid  = r.get("uid", "")
+                il   = r.get("inline-layer")
+                il_mark = " [inline-layer]" if il else ""
+                print(f"  {idx:<5}  {uid:<38}  {name:<35}  {action}{il_mark}")
+            print(f"\n  Total: {len(rules_list)} rules\n")
+            return 0
 
         # --list-layers mode: discover and print all layers then exit -----------
         if args.list_layers:
