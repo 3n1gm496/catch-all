@@ -301,52 +301,135 @@ class RuleFetcher:
         self.package = package
 
     # ------------------------------------------------------------------
-    def get_rule(self, layer_uuid: str, rule_uuid: str) -> RuleDetails:
-        """Retrieve a single access rule by its UID."""
-        log.info("Fetching rule %s from layer %s …", rule_uuid, layer_uuid)
+    def get_rule(self, layer_hint: str, rule_uuid: str) -> RuleDetails:
+        """
+        Retrieve a single access rule by scanning the correct layer.
+
+        layer_hint can be a layer UID, a layer name, or the CP implicit-layer
+        format (*_<uuid>). We first resolve the actual layer by calling
+        show-package, then walk the rulebase.
+
+        Note: show-access-rule is NOT used because it is absent in CP API
+        versions prior to R80.40 (API 2.0). Rulebase scanning is the
+        compatible approach.
+        """
+        log.info("Fetching rule %s (layer hint: %s) …", rule_uuid, layer_hint)
+        layer_selector = self._resolve_layer(layer_hint)
+        data = self._find_rule_in_rulebase(layer_selector, rule_uuid)
+        return self._parse_rule(data, layer_hint)
+
+    # ------------------------------------------------------------------
+    def _resolve_layer(self, layer_hint: str) -> Dict[str, Any]:
+        """
+        Resolve layer_hint to a layer selector dict suitable for
+        show-access-rulebase.
+
+        Strategy:
+          1. Call show-package to get the package's access-layers list.
+          2. Try to match layer_hint against each layer's uid or name.
+          3. If no match, warn and list available layers; fall back to
+             using the hint directly so the server returns its own error.
+        """
+        log.info("Discovering layers for package '%s' …", self.package)
         try:
-            data = self.session.call(
-                "show-access-rule",
-                {"uid": rule_uuid, "layer": layer_uuid},
+            pkg_resp = self.session.call(
+                "show-package",
+                {"name": self.package, "details-level": "standard"},
             )
         except RuntimeError as exc:
-            # Fallback: iterate the rulebase to find the rule
-            log.warning("Direct show-access-rule failed (%s); scanning rulebase …", exc)
-            data = self._find_rule_in_rulebase(layer_uuid, rule_uuid)
+            log.warning(
+                "show-package failed (%s); will attempt layer hint directly.", exc
+            )
+            return {"uid": layer_hint}
 
-        return self._parse_rule(data, layer_uuid)
+        layers: List[Dict[str, Any]] = pkg_resp.get("access-layers") or []
+        if not layers:
+            log.warning(
+                "Package '%s' returned no access-layers. "
+                "Will attempt layer hint directly.",
+                self.package,
+            )
+            return {"uid": layer_hint}
+
+        # Log all available layers to help users identify the correct one
+        for lyr in layers:
+            log.info(
+                "  Available layer: name='%s'  uid='%s'",
+                lyr.get("name", ""),
+                lyr.get("uid", ""),
+            )
+
+        # Try exact match on uid first, then name
+        for lyr in layers:
+            if lyr.get("uid") == layer_hint or lyr.get("name") == layer_hint:
+                log.info("Layer resolved: '%s' (%s)", lyr.get("name"), lyr.get("uid"))
+                return {"uid": lyr["uid"]} if lyr.get("uid") else {"name": lyr["name"]}
+
+        # Partial match: layer_hint is a suffix of the UID (the *_<uuid> format)
+        hint_clean = layer_hint.lstrip("*_")
+        for lyr in layers:
+            uid = lyr.get("uid", "")
+            if uid.endswith(hint_clean) or hint_clean in uid:
+                log.info(
+                    "Layer resolved via partial UID match: '%s' (%s)",
+                    lyr.get("name"), uid,
+                )
+                return {"uid": uid}
+
+        # No match found — list all available layers and fall back to direct hint
+        available = [
+            f"'{lyr.get('name', '')}' (uid={lyr.get('uid', '')})" for lyr in layers
+        ]
+        log.warning(
+            "Layer hint '%s' did not match any layer in package '%s'.\n"
+            "  Available layers:\n    %s\n"
+            "  Tip: use --layer-uuid with the exact uid shown above, or\n"
+            "       use --layer-name with the exact layer name.",
+            layer_hint,
+            self.package,
+            "\n    ".join(available),
+        )
+        # Use the first layer as a last-resort fallback so we still get output
+        first = layers[0]
+        log.warning(
+            "Falling back to first layer: '%s' (%s)",
+            first.get("name"), first.get("uid"),
+        )
+        return {"uid": first["uid"]} if first.get("uid") else {"name": first["name"]}
 
     # ------------------------------------------------------------------
     def _find_rule_in_rulebase(
-        self, layer_uuid: str, rule_uuid: str
+        self, layer_selector: Dict[str, Any], rule_uuid: str
     ) -> Dict[str, Any]:
         """Walk through the rulebase and return the matching rule dict."""
         offset = 0
-        limit  = 50
+        limit  = 200   # matches fw-review's page_limit default
         while True:
-            resp = self.session.call(
-                "show-access-rulebase",
-                {
-                    "uid": layer_uuid,
-                    "limit": limit,
-                    "offset": offset,
-                    "use-object-dictionary": True,
-                    "details-level": "full",
-                },
-            )
+            payload = {
+                **layer_selector,
+                "offset": offset,
+                "limit": limit,
+                "details-level": "standard",
+                "use-object-dictionary": False,
+                "show-hits": False,
+            }
+            resp = self.session.call("show-access-rulebase", payload)
             rulebase = resp.get("rulebase", [])
             for item in rulebase:
-                # Sections contain sub-items
                 for rule in _flatten_rulebase(item):
                     if rule.get("uid") == rule_uuid:
                         return rule
             total = resp.get("total", 0)
-            offset += limit
-            if offset >= total:
+            fetched = len(rulebase)
+            offset += fetched
+            if total and offset >= int(total):
+                break
+            if fetched < limit:
                 break
 
+        layer_label = layer_selector.get("uid") or layer_selector.get("name", "?")
         raise ValueError(
-            f"Rule {rule_uuid} not found in layer {layer_uuid} / package {self.package}"
+            f"Rule {rule_uuid} not found in layer {layer_label} / package {self.package}"
         )
 
     # ------------------------------------------------------------------
@@ -428,19 +511,14 @@ class LogFetcher:
         days: int,
     ) -> List[LogEntry]:
         """Fetch and return all log entries matching the rule."""
-        end_dt   = datetime.now(timezone.utc)
-        start_dt = end_dt - timedelta(days=days)
-        start_s  = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_s    = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
         log.info(
-            "Querying logs for rule '%s' (%s) — %s to %s …",
-            rule_name, rule_uid, start_s, end_s,
+            "Querying logs for rule '%s' (%s) — last %d days …",
+            rule_name, rule_uid, days,
         )
 
         logs: List[LogEntry] = []
         try:
-            logs = self._fetch_by_uid(rule_uid, start_s, end_s)
+            logs = self._fetch_by_uid(rule_uid, days)
         except Exception as exc:
             log.warning("show-logs by uid failed: %s", exc)
 
@@ -462,56 +540,66 @@ class LogFetcher:
         return logs
 
     # ------------------------------------------------------------------
-    def _fetch_by_uid(
-        self, rule_uid: str, start_s: str, end_s: str
-    ) -> List[LogEntry]:
-        """Use show-logs with rule_uid filter + pagination."""
+    def _fetch_by_uid(self, rule_uid: str, days: int) -> List[LogEntry]:
+        """
+        Query show-logs using the format validated by the fw-review project
+        on this management station (API 2.0.1):
+
+            { "query": 'rule:"<uid>"',
+              "limit": N,
+              "offset": O,
+              "time-frame": "last-N-days" }
+
+        Paginate via offset until all results are retrieved.
+        """
         entries: List[LogEntry] = []
-        scroll_id: Optional[str] = None
-        fetched = 0
+        offset  = 0
+        # CP time-frame string: "last-30-days", "last-90-days" etc.
+        time_frame = f"last-{days}-days"
 
-        while fetched < MAX_LOGS:
-            if scroll_id is None:
-                payload: Dict[str, Any] = {
-                    "new-query": {
-                        "max-results": PAGE_SIZE,
-                        "type": "Log",
-                        "time-frame": {
-                            "start-iso-date": start_s,
-                            "end-iso-date": end_s,
-                        },
-                        "filter": f"rule_uid:{rule_uid}",
-                    }
-                }
-            else:
-                payload = {
-                    "scroll-id": scroll_id,
-                    "scroll-id-from": fetched,
-                }
-
+        while len(entries) < MAX_LOGS:
+            payload: Dict[str, Any] = {
+                "query"     : f'rule:"{rule_uid}"',
+                "limit"     : PAGE_SIZE,
+                "offset"    : offset,
+                "time-frame": time_frame,
+            }
             data = self.session.call("show-logs", payload)
 
-            # Handle async task response
+            # Handle async task response (some CP versions)
             if "taskId" in data or "task-id" in data:
                 task_id = data.get("taskId") or data.get("task-id")
                 data = self._wait_for_task(task_id)
 
-            batch = data.get("logs", [])
+            # CP API returns logs under different keys depending on version
+            batch = (
+                data.get("logs")
+                or data.get("records")
+                or data.get("data")
+                or []
+            )
             if not batch:
                 break
-
-            scroll_id = data.get("scroll-id")
 
             for raw_log in batch:
                 entry = self._parse_log(raw_log, rule_uid)
                 if entry is not None:
                     entries.append(entry)
 
-            fetched += len(batch)
-            total = data.get("total", 0)
-            log.debug("Fetched %d / %d logs …", fetched, total)
+            # Determine total from response (key varies by version)
+            total = (
+                data.get("logs-count")
+                or data.get("total")
+                or data.get("count")
+                or 0
+            )
+            offset += len(batch)
+            log.debug("Fetched %d / %s logs …", len(entries), total or "?")
 
-            if fetched >= total or not scroll_id:
+            if total and offset >= int(total):
+                break
+            if len(batch) < PAGE_SIZE:
+                # Last page
                 break
 
         return entries
@@ -1448,12 +1536,29 @@ Examples:
   python analyze_rule.py ... --output-dir ./output --quiet
 """,
     )
-    p.add_argument("--host",       default=DEFAULT_HOST,     help="CP management station IP/hostname")
-    p.add_argument("--username",   default=DEFAULT_USERNAME, help="API username")
-    p.add_argument("--password",   default=DEFAULT_PASSWORD, help="API password")
-    p.add_argument("--package",    default=DEFAULT_PACKAGE,  help="Policy package name")
-    p.add_argument("--layer-uuid", required=True,            help="Access layer UID")
-    p.add_argument("--rule-uuid",  required=True,            help="Rule UID to analyze")
+    p.add_argument("--host",        default=DEFAULT_HOST,     help="CP management station IP/hostname")
+    p.add_argument("--username",    default=DEFAULT_USERNAME, help="API username")
+    p.add_argument("--password",    default=DEFAULT_PASSWORD, help="API password")
+    p.add_argument("--package",     default=DEFAULT_PACKAGE,  help="Policy package name")
+
+    layer_grp = p.add_mutually_exclusive_group(required=False)
+    layer_grp.add_argument(
+        "--layer-uuid",
+        default=None,
+        help="Access layer UID (or the *_<uuid> implicit-layer format used by CP)",
+    )
+    layer_grp.add_argument(
+        "--layer-name",
+        default=None,
+        help="Access layer name (alternative to --layer-uuid)",
+    )
+
+    p.add_argument(
+        "--list-layers",
+        action="store_true",
+        help="List all access layers in the package and exit (no rule-uuid needed)",
+    )
+    p.add_argument("--rule-uuid",  default=None,            help="Rule UID to analyze")
     p.add_argument("--days",       type=int, default=DEFAULT_DAYS,
                    help=f"Days of log history to analyze (default: {DEFAULT_DAYS})")
     p.add_argument("--output-dir", default=None,
@@ -1473,11 +1578,19 @@ def main() -> int:
         log.setLevel(logging.DEBUG)
         logging.getLogger("urllib3").setLevel(logging.DEBUG)
 
-    # Validate days
     if args.days < 1:
         parser.error("--days must be >= 1")
 
-    # Session scope: always logout even if something fails
+    # --list-layers does not require --layer-uuid / --rule-uuid
+    if not args.list_layers:
+        if not args.rule_uuid:
+            parser.error("--rule-uuid is required (unless --list-layers is used)")
+        if not args.layer_uuid and not args.layer_name:
+            parser.error("--layer-uuid or --layer-name is required (unless --list-layers is used)")
+
+    # Resolve the layer hint: prefer explicit name, then uuid
+    layer_hint: str = args.layer_name or args.layer_uuid or ""
+
     session = CheckPointSession(
         host     = args.host,
         username = args.username,
@@ -1486,10 +1599,26 @@ def main() -> int:
 
     try:
         session.login()
+        fetcher = RuleFetcher(session, args.package)
+
+        # --list-layers mode: discover and print all layers then exit -----------
+        if args.list_layers:
+            log.info("Listing access layers for package '%s' …", args.package)
+            pkg_resp = session.call(
+                "show-package",
+                {"name": args.package, "details-level": "standard"},
+            )
+            layers = pkg_resp.get("access-layers") or []
+            print(f"\nAccess layers in package '{args.package}':")
+            print(f"  {'NAME':<40}  UID")
+            print(f"  {'─'*40}  {'─'*38}")
+            for lyr in layers:
+                print(f"  {lyr.get('name',''):<40}  {lyr.get('uid','')}")
+            print()
+            return 0
 
         # 1. Fetch rule details ------------------------------------------------
-        fetcher = RuleFetcher(session, args.package)
-        rule    = fetcher.get_rule(args.layer_uuid, args.rule_uuid)
+        rule = fetcher.get_rule(layer_hint, args.rule_uuid)
         log.info(
             "Rule found: '%s' | action=%s | enabled=%s",
             rule.name, rule.action, rule.enabled,
