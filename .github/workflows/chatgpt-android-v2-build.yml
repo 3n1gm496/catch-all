@@ -1,0 +1,35 @@
+name: Build Android V2 APK
+on:
+  push:
+    branches: [chatgpt-android-v2-build-20260923]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Restore project
+        run: |
+          mkdir -p android-v2-build/project
+          base64 -d android-v2-build/project.tgz.b64 | tar -xzf - -C android-v2-build/project
+      - name: Install SDK 35
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+      - name: Build APK
+        working-directory: android-v2-build/project
+        run: gradle --no-daemon :app:assembleDebug --stacktrace
+      - name: Prepare APK
+        run: |
+          cp android-v2-build/project/app/build/outputs/apk/debug/app-debug.apk android-v2-build/AreaRiservataPdfV2.apk
+          sha256sum android-v2-build/AreaRiservataPdfV2.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AreaRiservataPdfV2-APK
+          path: android-v2-build/AreaRiservataPdfV2.apk
