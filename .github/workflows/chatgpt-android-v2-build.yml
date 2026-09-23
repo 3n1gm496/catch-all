@@ -1,7 +1,7 @@
-name: Build Android V2 APK
+name: Build Android V2.2 APK
 on:
   push:
-    branches: [chatgpt-android-v2-build-20260923]
+    branches: [chatgpt-android-v22b-build-20260923]
 
 jobs:
   build:
@@ -19,6 +19,49 @@ jobs:
         run: |
           mkdir -p android-v2-build/project
           base64 -d android-v2-build/project.tgz.b64 | tar -xzf - -C android-v2-build/project
+      - name: Configure V2.2
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("android-v2-build/project")
+
+          p = root / "app/build.gradle"
+          s = p.read_text()
+          s = s.replace("versionCode 2", "versionCode 4")
+          s = s.replace("versionName '2.0'", "versionName '2.2'")
+          p.write_text(s)
+
+          p = root / "app/src/main/java/it/areariservata/pdfv2/SessionManager.java"
+          s = p.read_text()
+          s = s.replace(
+              'public String getServer() { return prefs.getString(K_SERVER, ""); }',
+              'public String getServer() { return prefs.getString(K_SERVER, "https://area-pdf.alessiodeioanni.workers.dev"); }'
+          )
+          marker = "    public boolean isLoggedIn() {"
+          migration = """    public void migrateServerIfNeeded() {
+              String current = normalizeServer(prefs.getString(K_SERVER, ""));
+              if (current.isEmpty() || "https://broad-night-c396.alessiodeioanni.workers.dev".equals(current)) {
+                  prefs.edit().putString(K_SERVER, "https://area-pdf.alessiodeioanni.workers.dev").apply();
+              }
+          }
+
+          """
+          s = s.replace(marker, migration + marker)
+          p.write_text(s)
+
+          p = root / "app/src/main/java/it/areariservata/pdfv2/LoginActivity.java"
+          s = p.read_text()
+          s = s.replace(
+              "session = new SessionManager(this);\n        if (session.isLoggedIn()) {",
+              "session = new SessionManager(this);\n        session.migrateServerIfNeeded();\n        if (session.isLoggedIn()) {"
+          )
+          s = s.replace("Documento centralizzato - V2", "Documento centralizzato - V2.2")
+          s = s.replace(
+              "La prima volta inserisci l'indirizzo workers.dev creato su Cloudflare. Verrà ricordato su questo dispositivo.",
+              "Server Cloudflare preconfigurato: area-pdf.alessiodeioanni.workers.dev"
+          )
+          p.write_text(s)
+          PY
       - name: Install SDK 35
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" >/dev/null
@@ -27,9 +70,9 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug --stacktrace
       - name: Prepare APK
         run: |
-          cp android-v2-build/project/app/build/outputs/apk/debug/app-debug.apk android-v2-build/AreaRiservataPdfV2.apk
-          sha256sum android-v2-build/AreaRiservataPdfV2.apk
+          cp android-v2-build/project/app/build/outputs/apk/debug/app-debug.apk android-v2-build/AreaRiservataPdfV22.apk
+          sha256sum android-v2-build/AreaRiservataPdfV22.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: AreaRiservataPdfV2-APK
-          path: android-v2-build/AreaRiservataPdfV2.apk
+          name: AreaRiservataPdfV22-APK
+          path: android-v2-build/AreaRiservataPdfV22.apk
