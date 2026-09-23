@@ -18,7 +18,7 @@ jobs:
       - name: Restore project
         run: |
           mkdir -p android-v2-build/project
-          base64 -d android-v2-build/project.tgz.b64 | tar -xzf - -C android-v2-build/project
+          cat android-v2-build/p1.b64 android-v2-build/p2.b64 | base64 -d | tar -xzf - -C android-v2-build/project
       - name: Configure V2.2
         run: |
           python3 - <<'PY'
